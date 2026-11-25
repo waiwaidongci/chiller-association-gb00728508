@@ -1,0 +1,15 @@
+@import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=Archivo+Black&display=swap');
+:root {
+  --text-font: 'Source Sans 3'; --title-font: 'Archivo Black';
+  --paper: oklch(.975 .012 77); --surface: oklch(.994 .006 77);
+  --ink: oklch(.235 .035 77); --quiet: oklch(.435 .038 77);
+  --stripe: oklch(.961 .014 77); --rule: oklch(.858 .024 77);
+  --accent: oklch(.445 0.11 77); --button-ink: oklch(.98 .007 77);
+  --focus: oklch(.64 0.11 77);
+  --side: oklch(.258 .041 77);
+  --side-ink: oklch(.975 .011 77);
+  --highlight: oklch(.36 .047 77);
+  --highlight-edge: oklch(.762 .096 77);
+  --side-width: 244px; --side-pad: 1.25rem;
+  --login-ratio: 1.52fr; --report-stripe: 7px;
+}
