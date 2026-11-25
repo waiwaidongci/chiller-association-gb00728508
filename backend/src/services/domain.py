@@ -135,16 +135,22 @@ def _result_row(alarm, scope, stratum, support, exposed, comparison, rates, rati
     }
 
 
+def _eligibility(strata, min_minutes, min_events):
+    return [
+        (key, exposed, comparison, _support(exposed, comparison, min_minutes, min_events))
+        for key, (exposed, comparison) in sorted(strata.items())
+    ]
+
+
 def _analyze_alarm(alarm, strata, min_minutes, min_events):
     details = []
     eligible = []
-    for (room, load), (exposed, comparison) in sorted(strata.items()):
-        reason = _support(exposed, comparison, min_minutes, min_events)
+    for (room, load), exposed, comparison, reason in _eligibility(strata, min_minutes, min_events):
         ratio = None
         if reason:
             status = reason
         else:
-            eligible.append((exposed, comparison))
+            eligible.append(((room, load), exposed, comparison))
             if comparison.events:
                 ratio = _round(exposed.rate / comparison.rate)
                 status = f'达到分层门槛，{_interpret(ratio)}'
@@ -155,32 +161,38 @@ def _analyze_alarm(alarm, strata, min_minutes, min_events):
             (exposed.rate, comparison.rate), ratio, None, status,
         ))
 
-    exposed_total = Exposure(sum(a.minutes for a, _ in eligible), sum(a.events for a, _ in eligible))
-    comparison_total = Exposure(sum(b.minutes for _, b in eligible), sum(b.events for _, b in eligible))
+    exposed_total = Exposure(sum(a.minutes for _, a, _ in eligible), sum(a.events for _, a, _ in eligible))
+    comparison_total = Exposure(sum(b.minutes for _, _, b in eligible), sum(b.events for _, _, b in eligible))
     total_minutes = exposed_total.minutes + comparison_total.minutes
     crude_ratio = (
         _round(exposed_total.rate / comparison_total.rate) if comparison_total.events else None
     )
     rates = (None, None)
     ratio = None
+    plan = None
     if len(eligible) < 2:
         status = '共同达标层少于两层，请补齐同层有无告警记录后复算'
     else:
         # Apply one exposure distribution to both arms, using combined runtime in each eligible stratum.
         rates = (
-            sum((a.minutes + b.minutes) * a.rate for a, b in eligible) / total_minutes,
-            sum((a.minutes + b.minutes) * b.rate for a, b in eligible) / total_minutes,
+            sum((a.minutes + b.minutes) * a.rate for _, a, b in eligible) / total_minutes,
+            sum((a.minutes + b.minutes) * b.rate for _, a, b in eligible) / total_minutes,
         )
         if rates[1] > 0:
             ratio = _round(rates[0] / rates[1])
             status = _interpret(ratio)
+            # Freeze the original eligible strata and weights for leave-one-out rounds.
+            plan = {
+                'strata': [key for key, _, _ in eligible],
+                'weights': [(a.minutes + b.minutes) / total_minutes for _, a, b in eligible],
+            }
         else:
             status = '标准化对照率为零，率比未定义，请补充对照监测资料后复算'
     summary = _result_row(
         alarm, '直接标准化', '共同达标层', f'{len(eligible)} / {len(strata)}', exposed_total, comparison_total,
         rates, ratio, crude_ratio, status,
     )
-    return summary, details
+    return summary, details, plan
 
 
 def compute(rows: list[dict], options: dict) -> dict:
@@ -192,7 +204,7 @@ def compute(rows: list[dict], options: dict) -> dict:
     summaries = []
     details = []
     for alarm, strata in grouped.items():
-        summary, alarm_details = _analyze_alarm(alarm, strata, min_hours * 60, min_events)
+        summary, alarm_details, _ = _analyze_alarm(alarm, strata, min_hours * 60, min_events)
         summaries.append(summary)
         details.extend(alarm_details)
     ranked = sorted(
@@ -230,4 +242,106 @@ def compute(rows: list[dict], options: dict) -> dict:
             'points': [{'label': row['伴随告警'], 'value': row['率比']} for row in ranked],
         },
         'can_publish': bool(ranked),
+    }
+
+
+def plan_sensitivity(rows: list[dict], options: dict) -> dict:
+    """Fix each alarm's original eligible strata and weights from the full dataset."""
+    min_minutes = _integer_option(options, 'min_hours', 24, 120_000, '每层每组最低监测小时') * 60
+    min_events = _integer_option(options, 'min_events', 3, 432_000_000, '每层两组最低目标事件总数')
+    plans = {}
+    ranked = []
+    for alarm, strata in _group_exposure(rows).items():
+        summary, _, plan = _analyze_alarm(alarm, strata, min_minutes, min_events)
+        if plan is not None:
+            plans[alarm] = plan
+            ranked.append((alarm, summary['率比']))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return {
+        'min_minutes': min_minutes,
+        'min_events': min_events,
+        'plans': plans,
+        'baseline_top': ranked[0][0] if ranked else None,
+    }
+
+
+def leave_one_out(rows: list[dict], asset: str, bundle: dict) -> dict:
+    """Recompute one round without the unit, on the original strata and weights only."""
+    kept = [row for row in rows if row['asset_id'] != asset]
+    outcome = {
+        'asset_id': asset,
+        'removed_days': len(rows) - len(kept),
+        'removed_hours': _round(sum(row['runtime_minutes'] for row in rows if row['asset_id'] == asset) / 60),
+        'top': None,
+        'verdict': '缺数原因',
+        'reason': '',
+        'alarms': [],
+    }
+    if len(kept) < 2:
+        outcome['reason'] = '剔除该机组后剩余记录不足两条，无法复算'
+        outcome['alarms'] = [{'alarm': alarm, 'ratio': None, 'reason': '剔除后剩余记录不足两条'} for alarm in COALARMS]
+        return outcome
+    grouped = _group_exposure(kept)
+    for alarm in COALARMS:
+        plan = bundle['plans'].get(alarm)
+        if plan is None:
+            outcome['alarms'].append({'alarm': alarm, 'ratio': None, 'reason': '全量分析未产生标准化率比，不参与复算'})
+            continue
+        exposures = []
+        reasons = []
+        for (room, load), weight in zip(plan['strata'], plan['weights']):
+            exposed, comparison = grouped[alarm].get((room, load), (Exposure(), Exposure()))
+            reason = _support(exposed, comparison, bundle['min_minutes'], bundle['min_events'])
+            if reason:
+                reasons.append(f'{room} / {load}：{reason}')
+            exposures.append((exposed, weight, comparison))
+        if reasons:
+            outcome['alarms'].append({'alarm': alarm, 'ratio': None, 'reason': '；'.join(reasons)})
+            continue
+        standardized = (
+            sum(weight * exposed.rate for exposed, weight, _ in exposures),
+            sum(weight * comparison.rate for _, weight, comparison in exposures),
+        )
+        if not standardized[1]:
+            outcome['alarms'].append({'alarm': alarm, 'ratio': None, 'reason': '对照率归零，率比未定义'})
+            continue
+        outcome['alarms'].append({'alarm': alarm, 'ratio': _round(standardized[0] / standardized[1]), 'reason': ''})
+    ranked = sorted((entry for entry in outcome['alarms'] if entry['ratio'] is not None),
+                    key=lambda entry: entry['ratio'], reverse=True)
+    if ranked:
+        outcome['top'] = ranked[0]['alarm']
+        outcome['verdict'] = '首位保持' if outcome['top'] == bundle['baseline_top'] else '首位易主'
+    else:
+        outcome['reason'] = '本轮所有告警均无法复算率比'
+    return outcome
+
+
+def sensitivity_summary(bundle: dict, assets: list[str], rounds: dict) -> dict:
+    """Assemble the panel once every unit has a conclusion or a missing-data reason."""
+    method = '逐台复核口径：逐台去掉该机组全部日期，沿用全量分析各告警原有的达标层与权重复算标准化率比；原层缺组、未达门槛或对照率归零时，该轮记原因，不换层凑排名。'
+    if bundle['baseline_top'] is None:
+        return {'applicable': False, 'method': method,
+                'note': '全量分析没有可报告的标准化率比，无联查首位，逐台剔除复核不适用。'}
+    ordered = [rounds[asset] for asset in assets]
+    changed = [entry['asset_id'] for entry in ordered if entry['verdict'] == '首位易主']
+    missing = [entry['asset_id'] for entry in ordered if entry['verdict'] == '缺数原因']
+    held = len(ordered) - len(changed) - len(missing)
+    if changed:
+        headline = f"剔除{'、'.join(changed)}后联查首位易主，全量首位为{bundle['baseline_top']}，复核时请先核对这些机组的底账。"
+    elif missing:
+        headline = f'可复算的 {held} 台机组剔除后联查首位均保持为{bundle["baseline_top"]}。'
+    else:
+        headline = f'{len(ordered)} 台机组逐台剔除后联查首位均保持为{bundle["baseline_top"]}，首位结果稳健。'
+    if missing:
+        headline += f"{'、'.join(missing)}因缺数未得出本轮结论。"
+    return {
+        'applicable': True,
+        'method': method,
+        'baseline_top': bundle['baseline_top'],
+        'total': len(ordered),
+        'held': held,
+        'changed': changed,
+        'missing': missing,
+        'rounds': ordered,
+        'headline': headline,
     }

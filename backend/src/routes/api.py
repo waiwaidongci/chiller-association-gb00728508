@@ -3,8 +3,8 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from src.config.settings import ARTIFACTS
-from src.constants.enums import Role
-from src.controllers.query import delivery_status, jobs, recent_activity, require_row, revisions
+from src.constants.enums import Role, State
+from src.controllers.query import delivery_status, jobs, recent_activity, require_row, revisions, sensitivity_progress
 from src.models.tables import datasets, runs
 from src.schemas.requests import Delivery, Import, Login, Review, Run
 from src.services.data import PROFILE, csv_records, save_revision
@@ -74,7 +74,10 @@ def queue(body: Run, account=Depends(analyst)):
 
 @router.get('/runs/{key}')
 def result(key: int, account=Depends(signed_in)):
-    return require_row(runs, key, '分析任务')
+    run = require_row(runs, key, '分析任务')
+    if run['state'] == State.running.value:
+        run['progress'] = sensitivity_progress(key, run['dataset_id'])
+    return run
 
 
 @router.post('/runs/{key}/review')

@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, Double, Integer, MetaData, String, Table, Text, UniqueConstraint
+from sqlalchemy import JSON, Column, Double, Integer, MetaData, PrimaryKeyConstraint, String, Table, Text, UniqueConstraint
 
 metadata = MetaData()
 users = Table('workspace_users', metadata, Column('username', String(40), primary_key=True),
@@ -17,6 +17,10 @@ schedules = Table('report_schedules', metadata, Column('id', Integer, primary_ke
                   Column('run_id', Integer, nullable=False), Column('recipient', String(100), nullable=False),
                   Column('cadence', String(16), nullable=False), Column('next_at', Double, nullable=False, index=True),
                   Column('active', Integer, nullable=False), Column('owner', String(40), nullable=False))
+unit_rounds = Table('sensitivity_rounds', metadata, Column('run_id', Integer, nullable=False),
+                    Column('asset_id', String(180), nullable=False), Column('claim', Double, nullable=False),
+                    Column('outcome', JSON, nullable=False), Column('finished', Double, nullable=False),
+                    PrimaryKeyConstraint('run_id', 'asset_id'))
 deliveries = Table('report_deliveries', metadata, Column('id', Integer, primary_key=True),
                    Column('schedule_id', Integer, nullable=False), Column('run_id', Integer, nullable=False),
                    Column('recipient', String(100), nullable=False), Column('scheduled', Double, nullable=False),

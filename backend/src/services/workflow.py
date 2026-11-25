@@ -2,11 +2,13 @@ import time
 
 from fastapi import HTTPException
 from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from src.constants.enums import State
 from src.models.database import add_event, engine, fetch_one
-from src.models.tables import datasets, deliveries, runs, schedules
+from src.models.tables import datasets, deliveries, runs, schedules, unit_rounds
 from src.services.data import parse_options
+from src.services.domain import leave_one_out, plan_sensitivity, sensitivity_summary
 
 
 def add_run(body, actor):
@@ -46,6 +48,58 @@ def finish_run(key, claim, result, error):
                                                   error=error, finished=now))
         if saved.rowcount:
             add_event(connection, 'worker', state, key, now)
+
+
+def load_rounds(key):
+    with engine.connect() as connection:
+        rows = connection.execute(select(unit_rounds.c.asset_id, unit_rounds.c.outcome)
+                                  .where(unit_rounds.c.run_id == key)).all()
+    return {asset: outcome for asset, outcome in rows}
+
+
+def record_round(key, claim, asset, outcome):
+    """Persist one unit round fenced by the current claim, renewing the claim lease.
+
+    Returns the renewed claim, or None once another execution has taken over:
+    late results from the old execution must not be written.
+    """
+    now = time.time()
+    try:
+        with engine.begin() as connection:
+            renewed = connection.execute(update(runs).where(runs.c.id == key, runs.c.started == claim,
+                                         runs.c.state == State.running.value).values(started=now)).rowcount
+            if renewed != 1:
+                return None
+            existing = connection.scalar(select(unit_rounds.c.run_id)
+                                         .where(unit_rounds.c.run_id == key, unit_rounds.c.asset_id == asset))
+            if existing is None:
+                connection.execute(insert(unit_rounds).values(run_id=key, asset_id=asset, claim=now,
+                                                              outcome=outcome, finished=now))
+            return now
+    except IntegrityError:
+        return None
+
+
+def run_sensitivity(key, claim, rows, options):
+    """Leave one unit out at a time, resuming only unfinished units.
+
+    Returns (panel, claim) once every unit has a conclusion or a missing-data
+    reason, or None when this execution has been superseded mid-run.
+    """
+    bundle = plan_sensitivity(rows, options)
+    if bundle['baseline_top'] is None:
+        return sensitivity_summary(bundle, [], {}), claim
+    assets = sorted({row['asset_id'] for row in rows})
+    done = load_rounds(key)
+    for asset in assets:
+        if asset in done:
+            continue
+        outcome = leave_one_out(rows, asset, bundle)
+        claim = record_round(key, claim, asset, outcome)
+        if claim is None:
+            return None
+        done[asset] = outcome
+    return sensitivity_summary(bundle, assets, done), claim
 
 
 def review_run(key, body, actor):

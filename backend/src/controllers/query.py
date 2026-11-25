@@ -1,8 +1,8 @@
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.models.database import engine, fetch_one
-from src.models.tables import audit, datasets, deliveries, runs, schedules
+from src.models.tables import audit, datasets, deliveries, runs, schedules, unit_rounds
 
 
 def list_rows(table, fields=None, limit=100):
@@ -26,6 +26,14 @@ def require_row(table, key, label):
 
 def jobs():
     return list_rows(runs, [field for field in runs.c if field.name != 'result'])
+
+
+def sensitivity_progress(key, dataset_id):
+    with engine.connect() as connection:
+        done = connection.scalar(select(func.count()).select_from(unit_rounds).where(unit_rounds.c.run_id == key))
+        dataset = fetch_one(connection, datasets, dataset_id)
+    total = len({row['asset_id'] for row in dataset['records']}) if dataset else 0
+    return {'done': done, 'total': total}
 
 
 def delivery_status():
